@@ -26,6 +26,7 @@ const path = require('path');
 const dns = require('dns');
 const bcrypt = require('bcrypt');
 const process = require('process');
+const Display = require("./display");
 
 const SETUP_FILE = 'setup.json';
 const CONFIG_FILE = 'config.json';
@@ -806,6 +807,12 @@ function handleMessage(conn, msg, isRemote = false) {
 
   conn.lastActive = getms();
 }
+
+const display = new Display(config, getPipelines(), netif, sensors, isStreaming);
+
+setInterval(() => {
+  display.refreshData(config, getPipelines(), netif, sensors, isStreaming);
+}, 1000);
 
 server.listen(80);
 
