@@ -1,6 +1,6 @@
 /*
     belaUI - web UI for the BELABOX project
-    Copyright (C) 2020-2021 BELABOX project
+    Copyright (C) 2020-2022 BELABOX project
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -19,13 +19,14 @@ const http = require('http');
 const finalhandler = require('finalhandler');
 const serveStatic = require('serve-static');
 const ws = require('ws');
-const { exec, execSync, spawn, spawnSync } = require("child_process");
+const { exec, execSync, spawn, spawnSync, execFileSync, execFile } = require("child_process");
 const fs = require('fs')
 const crypto = require('crypto');
 const path = require('path');
 const dns = require('dns');
 const bcrypt = require('bcrypt');
 const process = require('process');
+const util = require('util');
 const Display = require("./display");
 
 const SETUP_FILE = 'setup.json';
@@ -34,6 +35,11 @@ const AUTH_TOKENS_FILE = 'auth_tokens.json';
 
 const BCRYPT_ROUNDS = 10;
 const ACTIVE_TO = 15000;
+
+/* Disable localization for any CLI commands we run */
+process.env['LANG'] = 'C';
+/* Make sure apt-get doesn't expect any interactive user input */
+process.env['DEBIAN_FRONTEND'] = 'noninteractive';
 
 /* Read the config and setup files */
 const setup = JSON.parse(fs.readFileSync(SETUP_FILE, 'utf8'));
@@ -85,12 +91,19 @@ try {
 }
 revisions['belacoder'] = getRevision(`${belacoderExec} -v`);
 revisions['srtla'] = getRevision(`${srtlaSendExec} -v`);
+// Only show a BELABOX image version if it exists
+try {
+  revisions['BELABOX image'] = fs.readFileSync('/etc/belabox_img_version', 'utf8').trim();
+} catch(err) {};
 console.log(revisions);
 
 let config;
+let sshPasswordHash;
 try {
   config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
   console.log(config);
+  sshPasswordHash = config.ssh_pass_hash;
+  delete config.ssh_pass_hash;
 } catch (err) {
   console.log(`Failed to open the config file: ${err.message}. Creating an empty config`);
   config = {};
@@ -108,7 +121,10 @@ try {
 }
 
 function saveConfig() {
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config));
+  config.ssh_pass_hash = sshPasswordHash;
+  const c = JSON.stringify(config);
+  delete config.ssh_pass_hash;
+  fs.writeFileSync(CONFIG_FILE, c);
 }
 
 function savePersistentTokens() {
@@ -133,7 +149,6 @@ wss.on('connection', function connection(conn) {
   }
 
   conn.on('message', function incoming(msg) {
-    console.log(msg);
     try {
       msg = JSON.parse(msg);
       handleMessage(conn, msg);
@@ -145,9 +160,26 @@ wss.on('connection', function connection(conn) {
 
 
 /* Misc helpers */
+const oneMinute = 60 * 1000;
+const oneHour = 60 * oneMinute;
+const oneDay = 24 * oneHour;
+
 function getms() {
   const [sec, ns] = process.hrtime();
   return sec * 1000 + Math.floor(ns / 1000 / 1000);
+}
+
+async function readTextFile(file) {
+  const readFile = util.promisify(fs.readFile);
+  const contents = await readFile(file).catch(function(err) {return undefined});
+  if (contents === undefined) return;
+  return contents.toString('utf8');
+}
+
+async function writeTextFile(file, contents) {
+  const writeFile = util.promisify(fs.writeFile);
+  await writeFile(file, contents).catch(function() {return false});
+  return true;
 }
 
 
@@ -228,6 +260,7 @@ function getPipelineList() {
 
 /* Network interface list */
 let netif = {};
+
 function updateNetif() {
   exec("ifconfig", (error, stdout, stderr) => {
     if (error) {
@@ -238,15 +271,30 @@ function updateNetif() {
     let foundNewInt = false;
     const newints = {};
 
+    wiFiDeviceListStartUpdate();
+
     const interfaces = stdout.split("\n\n");
     for (const int of interfaces) {
       try {
-        const name = int.split(':')[0]
+        const name = int.split(':')[0];
+
+        let inetAddr = int.match(/inet (\d+\.\d+\.\d+\.\d+)/);
+        if (inetAddr) inetAddr = inetAddr[1];
+
+        // update the list of WiFi devices
+        if (name && name.match('^wlan')) {
+          let hwAddr = int.match(/ether ([0-9a-f:]+)/);
+          if (hwAddr) {
+            wiFiDeviceListAdd(name, hwAddr[1], inetAddr);
+          }
+        }
+
         if (name == 'lo' || name.match('^docker') || name.match('^l4tbr')) continue;
 
-        let inetAddr = int.match(/inet \d+\.\d+\.\d+\.\d+/);
-        if (inetAddr == null) continue;
-        inetAddr = inetAddr[0].split(' ')[1]
+        if (!inetAddr) continue;
+
+        const flags = int.match(/flags=\d+<([A-Z,]+)>/)[1].split(',');
+        if (!flags.includes('RUNNING')) continue;
 
         let txBytes = int.match(/TX packets \d+  bytes \d+/);
         txBytes = parseInt(txBytes[0].split(' ').pop());
@@ -271,6 +319,12 @@ function updateNetif() {
     if (foundNewInt && isStreaming) {
       updateSrtlaIps();
     }
+
+    if (wiFiDeviceListEndUpdate()) {
+      console.log("updated wifi devices");
+      // a delay seems to be needed before NM registers new devices
+      setTimeout(wifiUpdateDevices, 1000);
+    }
   });
 }
 updateNetif();
@@ -292,7 +346,7 @@ function handleNetif(conn, msg) {
 
   if (msg['enabled'] === true || msg['enabled'] === false) {
     if (!msg['enabled'] && int.enabled && countActiveNetif() == 1) {
-      sendError(conn, "Can't disable all networks");
+      notificationSend(conn, "netif_disable_all", "error", "Can't disable all networks", 10);
     } else {
       int.enabled = msg['enabled'];
       if (isStreaming) {
@@ -304,8 +358,599 @@ function handleNetif(conn, msg) {
   conn.send(buildMsg('netif', netif));
 }
 
+
+/*
+  WiFi device list / status maintained by periodic ifconfig updates
+
+  It tracks and detects changes by device name, physical (MAC) addresses and
+  IPv4 address. It allows us to only update the WiFi status via nmcli when
+  something has changed, because NM is very CPU / power intensive compared
+  to the periodic ifconfig polling that belaUI is already doing
+*/
+let wifiDeviceHwAddr = {};
+let wiFiDeviceListIsModified = false;
+let wiFiDeviceListIsUpdating = false;
+
+function wiFiDeviceListStartUpdate() {
+  if (wiFiDeviceListIsUpdating) {
+    throw "Called while an update was already in progress";
+  }
+
+  for (const i in wifiDeviceHwAddr) {
+    wifiDeviceHwAddr[i].removed = true;
+  }
+  wiFiDeviceListIsUpdating = true;
+  wiFiDeviceListIsModified = false
+}
+
+function wiFiDeviceListAdd(ifname, hwAddr, inetAddr) {
+  if (!wiFiDeviceListIsUpdating) {
+    throw "Called without starting an update";
+  }
+
+  if (wifiDeviceHwAddr[ifname]) {
+    if (wifiDeviceHwAddr[ifname].hwAddr != hwAddr) {
+      wifiDeviceHwAddr[ifname].hwAddr = hwAddr;
+      wiFiDeviceListIsModified = true;
+    }
+    if (wifiDeviceHwAddr[ifname].inetAddr != inetAddr) {
+      wifiDeviceHwAddr[ifname].inetAddr = inetAddr;
+      wiFiDeviceListIsModified = true;
+    }
+    wifiDeviceHwAddr[ifname].removed = false;
+  } else {
+    wifiDeviceHwAddr[ifname] = {
+      hwAddr,
+      inetAddr
+    };
+    wiFiDeviceListIsModified = true;
+  }
+}
+
+function wiFiDeviceListEndUpdate() {
+  if (!wiFiDeviceListIsUpdating) {
+    throw "Called without starting an update";
+  }
+
+  for (const i in wifiDeviceHwAddr) {
+    if (wifiDeviceHwAddr[i].removed) {
+      delete wifiDeviceHwAddr[i];
+      wiFiDeviceListIsModified = true;
+    }
+  }
+
+  wiFiDeviceListIsUpdating = false;
+  return wiFiDeviceListIsModified;
+}
+
+function wifiDeviceListGetAddr(ifname) {
+  if (wifiDeviceHwAddr[ifname]) {
+    return wifiDeviceHwAddr[ifname].hwAddr;
+  }
+}
+
+
+/* NetworkManager / nmcli helpers */
+function nmConnsGet(fields) {
+  try {
+    const result = execFileSync("nmcli", [
+      "--terse",
+      "--fields",
+      fields,
+      "connection",
+      "show",
+    ]).toString("utf-8").split("\n");
+    return result;
+
+  } catch ({message}) {
+    console.log(`nmConnsGet err: ${message}`);
+  }
+}
+
+function nmConnGetFields(uuid, fields) {
+  try {
+    const result = execFileSync("nmcli", [
+      "--terse",
+      "--escape", "no",
+      "--get-values",
+      fields,
+      "connection",
+      "show",
+      uuid,
+    ]).toString("utf-8").split("\n");
+    return result;
+
+  } catch ({message}) {
+    console.log(`nmConnGetFields err: ${message}`);
+  }
+}
+
+function nmConnDelete(uuid, callback) {
+  execFile("nmcli", ["conn", "del", uuid], function (error, stdout, stderr) {
+    let success = true;
+    if (error || !stdout.match("successfully deleted")) {
+      console.log(`nmConnDelete err: ${stdout}`);
+      success = false;
+    }
+
+    if (callback) {
+      callback(success);
+    }
+  });
+}
+
+function nmConnect(uuid, callback) {
+  execFile("nmcli", ["conn", "up", uuid], function (error, stdout, stderr) {
+    let success = true;
+    if (error || !stdout.match("^Connection successfully activated")) {
+      console.log(`nmConnect err: ${stdout}`);
+      success = false;
+    }
+
+    if (callback) {
+      callback(success);
+    }
+  });
+}
+
+function nmDisconnect(uuid, callback) {
+  execFile("nmcli", ["conn", "down", uuid], function (error, stdout, stderr) {
+    let success = true;
+    if (error || !stdout.match("successfully deactivated")) {
+      console.log(`nmDisconnect err: ${stdout}`);
+      success = false;
+    }
+
+    if (callback) {
+      callback(success);
+    }
+  });
+}
+
+function nmDevices(fields) {
+  try {
+    const result = execFileSync("nmcli", [
+      "--terse",
+      "--fields",
+      fields,
+      "device",
+      "status",
+    ]).toString("utf-8").split("\n");
+    return result;
+
+  } catch ({message}) {
+    console.log(`nmDevices err: ${message}`);
+  }
+}
+
+function nmRescan(device, callback) {
+  const args = ["device", "wifi", "rescan"];
+  if (device) {
+    args.push("ifname");
+    args.push(device);
+  }
+  execFile("nmcli", args, function (error, stdout, stderr) {
+    let success = true;
+    if (error || stdout != "") {
+      console.log(`nmRescan err: ${stdout}`);
+      success = false;
+    }
+
+    if (callback) {
+      callback(success);
+    }
+  });
+}
+
+function nmScanResults(fields) {
+  try {
+    const result = execFileSync("nmcli", [
+      "--terse",
+      "--fields",
+      fields,
+      "device",
+      "wifi",
+    ]).toString("utf-8").split("\n");
+    return result;
+
+  } catch ({message}) {
+    console.log(`nmScanResults err: ${message}`);
+  }
+}
+
+// parses : separated values, with automatic \ escape detection and stripping
+function nmcliParseSep(value) {
+  return value.split(/(?<!\\):/).map(a => a.replace(/\\:/g, ':'));
+}
+
+
+/*
+  NetworkManager / nmcli based Wifi Manager
+
+  Structs:
+
+  WiFi list <wifiIfs>:
+  {
+    'mac': <wd>
+  }
+
+  WiFi id to MAC address mapping <wifiIdToHwAddr>:
+  {
+    id: 'mac'
+  }
+
+  Wifi device <wd>:
+  {
+    'id', // numeric id for the adapter - temporary for each belaUI execution
+    'ifname': 'wlanX',
+    'conn': 'uuid' or undefined; // the active connection
+    'available': Map{<an>},
+    'saved': {<sn>}
+  }
+
+  Available network <an>:
+  {
+    active, // is it currently connected?
+    ssid,
+    signal: 0-100,
+    security,
+    freq
+  }
+
+  Saved networks {<sn>}:
+  {
+    ssid: uuid,
+  }
+*/
+let wifiIfId = 0;
+let wifiIfs = {};
+let wifiIdToHwAddr = {};
+
+/* Builds the WiFi status structure sent over the network from the <wd> structures */
+function wifiBuildMsg() {
+  const ifs = {};
+  for (const i in wifiIfs) {
+    const id = wifiIfs[i].id;
+    const s = wifiIfs[i];
+
+    ifs[id] = {
+      ifname: s.ifname,
+      conn: s.conn,
+      available: Array.from(s.available.values()),
+      saved: s.saved
+    };
+  }
+
+  return ifs;
+}
+
+function wifiBroadcastState() {
+  broadcastMsg('status', {wifi: wifiBuildMsg()});
+}
+
+
+function wifiUpdateSavedConns() {
+  let connections = nmConnsGet("uuid,type");
+  if (connections === undefined) return;
+
+  for (const i in wifiIfs) {
+    wifiIfs[i].saved = {};
+  }
+
+  for (const connection of connections) {
+    try {
+      const [uuid, type] = nmcliParseSep(connection);
+
+      if (type !== "802-11-wireless") continue;
+
+      // Get the device the connection is bound to and the ssid
+      const [ssid, macTmp] = nmConnGetFields(uuid, "802-11-wireless.ssid,802-11-wireless.mac-address");
+
+      if (!ssid || !macTmp) continue;
+
+      const macAddr = macTmp.toLowerCase();
+      if (wifiIfs[macAddr]) {
+        wifiIfs[macAddr].saved[ssid] = uuid;
+      }
+    } catch (err) {
+      console.log(`Error getting the nmcli connection information: ${err.message}`);
+    }
+  }
+}
+
+function wifiUpdateScanResult() {
+  const wifiNetworks = nmScanResults("active,ssid,signal,security,freq,device");
+  if (!wifiNetworks) return;
+
+  for (const i in wifiIfs) {
+    wifiIfs[i].available = new Map();
+  }
+
+  for (const wifiNetwork of wifiNetworks) {
+    const [active, ssid, signal, security, freq, device] =
+      nmcliParseSep(wifiNetwork);
+
+    if (ssid == null || ssid == "") continue;
+
+    const hwAddr = wifiDeviceListGetAddr(device);
+    if (!wifiIfs[hwAddr] || (active != 'yes' && wifiIfs[hwAddr].available.has(ssid))) continue;
+
+    wifiIfs[hwAddr].available.set(ssid, {
+      active: (active == 'yes'),
+      ssid,
+      signal: parseInt(signal),
+      security,
+      freq: parseInt(freq),
+    });
+  }
+
+  wifiBroadcastState();
+}
+
+/*
+  The WiFi scan results are updated some time after a rescan command is issued /
+  some time after a new WiFi adapter is plugged in.
+  This function sets up a number of timers to broadcast the updated scan results
+  with the expectation that eventually it will capture any relevant new results
+*/
+function wifiScheduleScanUpdates() {
+  setTimeout(wifiUpdateScanResult, 1000);
+  setTimeout(wifiUpdateScanResult, 3000);
+  setTimeout(wifiUpdateScanResult, 5000);
+  setTimeout(wifiUpdateScanResult, 10000);
+}
+
+let unavailableDeviceRetryExpiry = 0;
+function wifiUpdateDevices() {
+  let newDevices = false;
+  let statusChange = false;
+  let unavailableDevices = false;
+
+  let networkDevices = nmDevices("device,type,state,con-uuid");
+  if (!networkDevices) return;
+
+  // sorts the results alphabetically by interface name
+  networkDevices.sort();
+
+  // mark all WiFi adapters as removed
+  for (const i in wifiIfs) {
+    wifiIfs[i].removed = true;
+  }
+
+  // Rebuild the id-to-hwAddr map
+  wifiIdToHwAddr = {};
+
+  for (const networkDevice of networkDevices) {
+    try {
+      const [ifname, type, state, connUuid] = nmcliParseSep(networkDevice);
+      const conn = (connUuid != '') ? connUuid : null;
+
+      if (type !== "wifi") continue;
+      if (state == "unavailable") {
+        unavailableDevices = true;
+        continue;
+      }
+
+      const hwAddr = wifiDeviceListGetAddr(ifname);
+      if (!hwAddr) continue;
+
+      if (wifiIfs[hwAddr]) {
+        // the interface is still available
+        delete wifiIfs[hwAddr].removed;
+
+        if (ifname != wifiIfs[hwAddr].ifname) {
+          wifiIfs[hwAddr].ifname = ifname;
+          statusChange = true;
+        }
+        if (conn != wifiIfs[hwAddr].conn) {
+          wifiIfs[hwAddr].conn = conn;
+          statusChange = true;
+        }
+      } else {
+        const id = wifiIfId++;
+
+        wifiIfs[hwAddr] = {
+          id,
+          ifname,
+          conn,
+          available: new Map(),
+          saved: {}
+        };
+        newDevices = true;
+        statusChange = true;
+      }
+      wifiIdToHwAddr[wifiIfs[hwAddr].id] = hwAddr;
+    } catch (err) {
+      console.log(`Error getting the nmcli WiFi device information: ${err.message}`);
+    }
+  }
+
+  // delete removed adapters
+  for (const i in wifiIfs) {
+    if (wifiIfs[i].removed) {
+      delete wifiIfs[i];
+      statusChange = true;
+    }
+  }
+
+  if (newDevices) {
+    wifiUpdateSavedConns();
+    wifiScheduleScanUpdates();
+  }
+  if (statusChange) {
+    wifiUpdateScanResult();
+  }
+  if (newDevices || statusChange) {
+    wifiBroadcastState();
+  }
+  console.log(wifiIfs);
+
+  /* If some wifi adapters were marked unavailable, recheck periodically
+     This might happen when the system has just booted up and the adapter
+     typically becomes available within 30 seconds.
+     Uses a 5 minute timeout to avoid polling nmcli forever */
+  if (unavailableDevices) {
+    if (unavailableDeviceRetryExpiry == 0) {
+      unavailableDeviceRetryExpiry = getms() + 5 * 60 * 1000; // 5 minute timeout
+      setTimeout(wifiUpdateDevices, 3000);
+      console.log("One or more Wifi interfaces are unavailable. Will retry periodically for the next 5 minutes");
+    } else if (getms() < unavailableDeviceRetryExpiry) {
+      setTimeout(wifiUpdateDevices, 3000);
+      console.log("One or more Wifi interfaces are still unavailable. Retrying in 3 seconds...");
+    }
+  } else {
+    unavailableDeviceRetryExpiry = 0;
+  }
+
+  return statusChange;
+}
+
+function wifiRescan() {
+  nmRescan(undefined, function(success) {
+    /* A rescan request will fail if a previous one is in progress,
+       but we still attempt to update the results */
+    wifiUpdateScanResult();
+    wifiScheduleScanUpdates();
+  });
+}
+
+/* Searches saved connections in wifiIfs by UUID */
+function wifiSearchConnection(uuid) {
+  let connFound;
+  for (const i in wifiIdToHwAddr) {
+    const macAddr = wifiIdToHwAddr[i];
+    for (const s in wifiIfs[macAddr].saved) {
+      if (wifiIfs[macAddr].saved[s] == uuid) {
+        connFound = i;
+        break;
+      }
+    }
+  }
+
+  return connFound;
+}
+
+function wifiDisconnect(uuid) {
+  if (wifiSearchConnection(uuid) === undefined) return;
+
+  nmDisconnect(uuid, function(success) {
+    if (success) {
+      wifiUpdateScanResult();
+      wifiScheduleScanUpdates();
+    }
+  });
+}
+
+function wifiForget(uuid) {
+  if (wifiSearchConnection(uuid) === undefined) return;
+
+  nmConnDelete(uuid, function(success) {
+    if (success) {
+      wifiUpdateSavedConns();
+      wifiUpdateScanResult();
+      wifiScheduleScanUpdates();
+    }
+  });
+}
+
+function wifiDeleteFailedConns() {
+  const connections = nmConnsGet("uuid,type,timestamp");
+  for (const c in connections) {
+    const [uuid, type, ts] = nmcliParseSep(connections[c]);
+    if (type !== "802-11-wireless") continue;
+    if (ts == 0) {
+      nmConnDelete(uuid);
+    }
+  }
+}
+
+function wifiNew(conn, msg) {
+  if (!msg.device || !msg.ssid) return;
+  if (!wifiIdToHwAddr[msg.device]) return;
+
+  const device = wifiIfs[wifiIdToHwAddr[msg.device]].ifname;
+
+  const args = [
+    "-w",
+    "15",
+    "device",
+    "wifi",
+    "connect",
+    msg.ssid,
+    "ifname",
+    device
+  ];
+
+  if (msg.password) {
+    args.push('password');
+    args.push(msg.password);
+  }
+
+  const senderId = conn.senderId;
+  execFile("nmcli", args, function(error, stdout, stderr) {
+    if (error || stdout.match('^Error:')) {
+      wifiDeleteFailedConns();
+
+      if (stdout.match('Secrets were required, but not provided')) {
+        conn.send(buildMsg('wifi', {new: {error: "auth", device: msg.device}}, senderId));
+      } else {
+        conn.send(buildMsg('wifi', {new: {error: "generic", device: msg.device}}, senderId));
+      }
+    } else if (stdout.match('successfully activated')) {
+      wifiUpdateSavedConns();
+      wifiUpdateScanResult();
+
+      conn.send(buildMsg('wifi', {new: {success: true, device: msg.device}}, senderId));
+    }
+  });
+}
+
+function wifiConnect(conn, uuid) {
+  const deviceId = wifiSearchConnection(uuid);
+  if (deviceId === undefined) return;
+
+  const senderId = conn.senderId;
+  nmConnect(uuid, function(success) {
+    wifiUpdateScanResult();
+    conn.send(buildMsg('wifi', {connect: success, device: deviceId}, senderId));
+  });
+}
+
+function handleWifi(conn, msg) {
+  for (const type in msg) {
+    switch(type) {
+      case 'connect':
+        wifiConnect(conn, msg[type]);
+        break;
+      case 'disconnect':
+        wifiDisconnect(msg[type]);
+        break;
+      case 'scan':
+        wifiRescan();
+        break;
+      case 'new':
+        wifiNew(conn, msg[type]);
+        break;
+      case 'forget':
+        wifiForget(msg[type]);
+        break;
+    }
+  }
+}
+
+
 /* Remote */
-const remoteProtocolVersion = 2;
+/*
+  A brief remote protocol version history:
+  1 - initial remote release
+  2 - belaUI password setting feature
+  3 - apt update feature
+  4 - ssh manager
+  5 - wifi manager
+  6 - notification sytem
+  7 - support for config.bitrate_overlay
+*/
+const remoteProtocolVersion = 7;
 const remoteEndpoint = 'wss://remote.belabox.net/ws/remote';
 const remoteTimeout = 5000;
 const remoteConnectTimeout = 10000;
@@ -396,7 +1041,7 @@ function remoteConnect() {
     console.log(`remote: trying to connect via ${bindIp}`);
 
     remoteStatusHandled = false;
-    remoteWs = new ws(remoteEndpoint, options = {localAddress: bindIp});
+    remoteWs = new ws(remoteEndpoint, (options = {localAddress: bindIp}));
     remoteWs.isAuthed = false;
     // Set a longer initial connection timeout - mostly to deal with slow DNS
     remoteWs.lastActive = getms() + remoteConnectTimeout - remoteTimeout;
@@ -438,6 +1083,119 @@ function setRemoteKey(key) {
 }
 
 
+/* Notification system */
+/*
+  conn - send it to a specific client, or undefined to broadcast
+  name - identifier for the notification, e.g. 'belacoder'
+  type - 'success', 'warning', 'error'
+  msg - the human readable notification message
+  duration - 0-never expires
+             or number of seconds until the notification expires
+             * an expired notification is hidden by the UI and removed from persistent notifications
+  isPersistent - show it to every new client, conn must be undefined for broadcast
+  isDismissable - is the user allowed to hide it?
+*/
+let persistentNotifications = new Map();
+
+function notificationSend(conn, name, type, msg, duration = 0, isPersistent = false, isDismissable = true) {
+  if (isPersistent && conn != undefined) {
+    console.log("error: attempted to send persistent unicast notification");
+    return false;
+  }
+
+  const notification = {
+                         name,
+                         type,
+                         msg,
+                         is_dismissable: isDismissable,
+                         is_persistent: isPersistent,
+                         duration
+                       };
+  let doSend = true;
+  if (isPersistent) {
+    let pn = persistentNotifications.get(name);
+    if (pn) {
+      // Rate limiting to once every second
+      if (pn.last_sent && ((pn.last_sent + 1000) > getms())) {
+        doSend = false;
+      }
+    } else {
+      pn = {};
+      persistentNotifications.set(name, pn)
+    }
+
+    Object.assign(pn, notification);
+    pn.updated = getms();
+
+    if (doSend) {
+      pn.last_sent = getms();
+    }
+  }
+
+  if (!doSend) return;
+
+  const notificationMsg = {
+                            show: [notification]
+                          };
+  if (conn) {
+    conn.send(buildMsg('notification', notificationMsg, conn.senderId));
+  } else {
+    broadcastMsg('notification', notificationMsg);
+  }
+
+  return true;
+}
+
+function notificationBroadcast(name, type, msg, duration = 0, isPersistent = false, isDismissable = true) {
+  notificationSend(undefined, name, type, msg, duration, isPersistent, isDismissable);
+}
+
+function notificationRemove(name) {
+  persistentNotifications.delete(name);
+
+  const msg = { remove: [name] };
+  broadcastMsg('notification', msg);
+}
+
+function _notificationIsLive(n) {
+  if (n.duration === 0) return 0;
+
+  const remainingDuration = Math.ceil(n.duration - (getms() - n.updated) / 1000);
+  if (remainingDuration <= 0) {
+    persistentNotifications.delete(n.name);
+    return false;
+  }
+  return remainingDuration;
+}
+
+function notificationExists(name) {
+  let pn = persistentNotifications.get(name);
+  if (!pn) return;
+
+  if (_notificationIsLive(pn) !== false) return pn;
+}
+
+function notificationSendPersistent(conn) {
+  const notifications = [];
+  for (const n of persistentNotifications) {
+    const remainingDuration = _notificationIsLive(n[1]);
+    if (remainingDuration !== false) {
+      notifications.push({
+        name: n[1].name,
+        type: n[1].type,
+        msg: n[1].msg,
+        is_dismissable: n[1].is_dismissable,
+        is_persistent: n[1].is_persistent,
+        duration: remainingDuration
+      });
+    }
+  }
+
+  const msg = { show: notifications };
+  conn.send(buildMsg('notification', msg));
+}
+
+
 /* Hardware monitoring */
 let sensors = {};
 function updateSensorsJetson() {
@@ -470,14 +1228,77 @@ if (setup['hw'] == 'jetson') {
 }
 
 
-/* Websocket packet handlers */
-function sendError(conn, msg, id = undefined) {
-  if (id === undefined) id = conn.senderId;
-  conn.send(buildMsg('error', {msg: msg}, id));
+/* Monitor the kernel log for undervoltage events */
+if (setup.hw == 'jetson') {
+  const dmesg = spawn("dmesg", ["-w"]);
+
+  dmesg.stdout.on('data', function(data) {
+    if (data.toString('utf8').match('soctherm: OC ALARM 0x00000001')) {
+      const msg = 'System undervoltage detected. ' +
+                  'You may experience system instability, ' +
+                  'including glitching, freezes and the modems disconnecting';
+      notificationBroadcast('jetson_undervoltage', 'error', msg, 10*60, true, false);
+    }
+  });
 }
 
+
+/* Check if there are any Cam Links plugged into a USB2 port */
+async function checkCamlinkUsb2() {
+  const readdir = util.promisify(fs.readdir);
+
+  const deviceDir = '/sys/bus/usb/devices';
+  const devices = await readdir(deviceDir);
+  let foundUsb2 = false;
+
+  for (const d of devices) {
+    try {
+      const vendor = await readTextFile(`${deviceDir}/${d}/idVendor`);
+      if (vendor != "0fd9\n") continue;
+
+      /*
+        With my unit it would appear that product ID 0x66 is used for USB3.0 and
+        0x67 is used for USB2.0, but I'm not sure if this is consistent between
+        different revisions. So we'll check bcdUSB (aka version) for both
+      */
+      const product = await readTextFile(`${deviceDir}/${d}/idProduct`);
+      if (product != "0066\n" && product != "0067\n") continue;
+
+      const version = await readTextFile(`${deviceDir}/${d}/version`);
+      if (!version.match('3.00')) {
+        foundUsb2 = true;
+      }
+    } catch(err) {}
+  }
+
+  if (foundUsb2) {
+    const msg = "Detected a Cam Link 4K connected via USB2. This will result in low framerate operation. Ensure that it's connected to a USB3.0 port and that you're using a USB3.0 extension cable.";
+    notificationBroadcast('camlink_usb2', 'error', msg, 0, true, false);
+    console.log('Detected a Cam Link 4K connected via USB2.0');
+  } else {
+    notificationRemove('camlink_usb2');
+    console.log('No Cam Link 4K connected via USB2.0');
+  }
+}
+
+// We use an UDEV rule to send a SIGUSR2 when an Elgato USB device is plugged in or out
+process.on('SIGUSR2', checkCamlinkUsb2);
+
+// check for Cam Links on USB2 at startup
+checkCamlinkUsb2();
+
+
 function startError(conn, msg, id = undefined) {
-  sendError(conn, msg, id);
+  const originalId = conn.senderId;
+  if (id !== undefined) {
+    conn.senderId = id;
+  }
+
+  notificationSend(conn, "start_error", "error", msg, 10);
+
+  if (id !== undefined) {
+    conn.senderId = originalId;
+  }
   conn.send(buildMsg('status', {is_streaming: false}));
   return false;
 }
@@ -499,7 +1320,18 @@ function setBitrate(params) {
   return config.max_br;
 }
 
-function updateConfig(conn, params, callback) {
+async function removeBitrateOverlay(pipelineFile) {
+  let pipeline = await readTextFile(pipelineFile);
+  if (!pipeline) return;
+
+  pipeline = pipeline.replace(/textoverlay[^!]*name=overlay[^!]*!/g, '');
+  const pipelineTmp = "/tmp/belacoder_pipeline";
+  if (!writeTextFile(pipelineTmp, pipeline)) return;
+
+  return pipelineTmp;
+}
+
+async function updateConfig(conn, params, callback) {
   // delay
   if (params.delay == undefined)
     return startError(conn, "audio delay not specified");
@@ -512,6 +1344,12 @@ function updateConfig(conn, params, callback) {
   let pipeline = searchPipelines(params.pipeline);
   if (pipeline == null)
     return startError(conn, "pipeline not found");
+
+  // remove the bitrate overlay unless enabled in the config
+  if (!params.bitrate_overlay) {
+    pipeline = await removeBitrateOverlay(pipeline);
+    if (!pipeline) return startError(conn, "failed to generate the pipeline file");
+  }
 
   // bitrate
   let bitrate = setBitrate(params);
@@ -547,6 +1385,7 @@ function updateConfig(conn, params, callback) {
       config.srt_streamid = params.srt_streamid;
       config.srtla_addr = params.srtla_addr;
       config.srtla_port = params.srtla_port;
+      config.bitrate_overlay = params.bitrate_overlay;
 
       saveConfig();
 
@@ -587,18 +1426,34 @@ function updateSrtlaIps() {
   spawnSync("killall", ['-HUP', "srtla_send"], { detached: true});
 }
 
-function spawnStreamingLoop(command, args, cooldown = 100) {
+let streamingProcesses = [];
+function spawnStreamingLoop(command, args, cooldown = 100, errCallback) {
   if (!isStreaming) return;
 
-  const process = spawn(command, args, { stdio: 'inherit' });
+  const process = spawn(command, args, { stdio: ['inherit', 'inherit', 'pipe'] });
+  streamingProcesses.push(process);
+
+  if (errCallback) {
+    process.stderr.on('data', function(data) {
+      data = data.toString('utf8');
+      console.log(data);
+      errCallback(data);
+    });
+  }
+
   process.on('exit', function(code) {
     setTimeout(function() {
-      spawnStreamingLoop(command, args, cooldown);
+      spawnStreamingLoop(command, args, cooldown, errCallback);
     }, cooldown);
   })
 }
 
 function start(conn, params) {
+  if (isStreaming || isUpdating()) {
+    sendStatus(conn);
+    return;
+  }
+
   const senderId = conn.senderId;
   updateConfig(conn, params, function(pipeline) {
     if (genSrtlaIpList() < 1) {
@@ -612,7 +1467,15 @@ function start(conn, params) {
                          config.srtla_addr,
                          config.srtla_port,
                          setup.ips_file
-                       ]);
+                       ], 100, function(err) {
+      let msg;
+      if (err.match('Failed to establish any initial connections')) {
+        msg = 'Failed to connect to the SRTLA server. Retrying...';
+      }
+      if (msg) {
+        notificationBroadcast('srtla', 'error', msg, duration = 5, isPersistent = true, isDismissable = false);
+      }
+    });
 
     const belacoderArgs = [
                             pipeline,
@@ -626,7 +1489,23 @@ function start(conn, params) {
       belacoderArgs.push('-s');
       belacoderArgs.push(config.srt_streamid);
     }
-    spawnStreamingLoop(belacoderExec, belacoderArgs, 2000);
+    spawnStreamingLoop(belacoderExec, belacoderArgs, 2000, function(err) {
+      let msg;
+      if (err.match('gstreamer error from alsasrc0')) {
+        msg = 'Capture card error (audio). Trying to restart...';
+      } else if (err.match('gstreamer error from v4l2src0')) {
+        msg = 'Capture card error (video). Trying to restart...';
+      } else if (err.match('Pipeline stall detected')) {
+        msg = 'The input source has stalled. Trying to restart...';
+      } else if (err.match('Failed to establish an SRT connection')) {
+        if (!notificationExists('srtla')) {
+          msg = 'Failed to connect to the SRT server. Retrying...';
+        }
+      }
+      if (msg) {
+        notificationBroadcast('belacoder', 'error', msg, duration = 5, isPersistent = true, isDismissable = false);
+      }
+    });
 
     updateStatus(true);
   });
@@ -634,6 +1513,13 @@ function start(conn, params) {
 
 function stop() {
   updateStatus(false);
+
+  // Remove the exit handlers which would restart the processes
+  for (const p of streamingProcesses) {
+    p.removeAllListeners('exit');
+  }
+  streamingProcesses = [];
+
   spawnSync("killall", ["srtla_send"], {detached: true});
   spawnSync("killall", ["belacoder"], {detached: true});
 }
@@ -642,12 +1528,27 @@ stop(); // make sure we didn't inherit an orphan runner process
 
 /* Misc commands */
 function command(conn, cmd) {
+  if (isStreaming || isUpdating()) {
+    sendStatus(conn);
+    return;
+  }
+
   switch(cmd) {
     case 'poweroff':
       spawnSync("poweroff", {detached: true});
       break;
     case 'reboot':
       spawnSync("reboot", {detached: true});
+      break;
+    case 'update':
+      startSoftwareUpdate();
+      break;
+    case 'start_ssh':
+    case 'stop_ssh':
+      startStopSsh(conn, cmd);
+      break;
+    case 'reset_ssh_pass':
+      resetSshPassword(conn);
       break;
   }
 }
@@ -674,12 +1575,294 @@ function handleConfig(conn, msg, isRemote) {
 }
 
 
+/* Software updates */
+let availableUpdates = setup.apt_update_enabled ? null : false;
+let softUpdateStatus = null;
+let aptGetUpdating = false;
+let aptGetUpdateFailures = 0;
+
+function isUpdating() {
+  return (softUpdateStatus != null);
+}
+
+function parseUpgradePackageCount(text) {
+  try {
+    const upgradedCount = parseInt(text.match(/(\d+) upgraded/)[1]);
+    const newlyInstalledCount = parseInt(text.match(/, (\d+) newly installed/)[1]);
+    const upgradeCount = upgradedCount + newlyInstalledCount;
+    return upgradeCount;
+  } catch(err) {
+    return undefined;
+  }
+}
+
+function parseUpgradeDownloadSize(text) {
+  try {
+    let downloadSize = text.split('Need to get ')[1];
+    downloadSize = downloadSize.split(/\/|( of archives)/)[0];
+    return downloadSize;
+  } catch(err) {
+    return undefined;
+  }
+}
+
+function getSoftwareUpdateSize() {
+  if (isStreaming || isUpdating() || aptGetUpdating) return;
+
+  exec("apt-get dist-upgrade --assume-no", function(err, stdout, stderr) {
+    console.log(stdout);
+    console.log(stderr);
+
+    /*
+    // Currently unused, may do some filtering in the future
+    let packageList = stdout.split("The following packages will be upgraded:\n")[1];
+    packageList = packageList.split(/\n\d+/)[0];
+    packageList = packageList.replace(/[\n ]+/g, ' ');
+    packageList = packageList.trim();
+    */
+
+    const upgradeCount = parseUpgradePackageCount(stdout);
+    let downloadSize;
+    if (upgradeCount > 0) {
+      downloadSize = parseUpgradeDownloadSize(stdout);
+    }
+    availableUpdates = {package_count: upgradeCount, download_size: downloadSize};
+    broadcastMsg('status', {available_updates: availableUpdates});
+  });
+}
+
+function checkForSoftwareUpdates(callback) {
+  if (isStreaming || isUpdating() || aptGetUpdating) return;
+
+  aptGetUpdating = true;
+  exec("apt-get update --allow-releaseinfo-change", function(err, stdout, stderr) {
+    aptGetUpdating = false;
+
+    if (stderr.length) err = true;
+    console.log(`apt-get update: ${(err === null) ? 'success' : 'error'}`);
+    console.log(stdout);
+    console.log(stderr);
+
+    if (err === null) {
+      aptGetUpdateFailures = 0;
+    } else {
+      aptGetUpdateFailures++;
+    }
+    if (callback) callback(err, aptGetUpdateFailures);
+  });
+}
+
+function periodicCheckForSoftwareUpdates() {
+  checkForSoftwareUpdates(function(err, failures) {
+    if (err === null) {
+      getSoftwareUpdateSize();
+    }
+    const interval = (err === null) ? oneDay : ((failures > 3) ? oneHour : oneMinute);
+    setTimeout(periodicCheckForSoftwareUpdates, interval);
+  });
+}
+if (setup.apt_update_enabled) {
+  periodicCheckForSoftwareUpdates();
+}
+
+function startSoftwareUpdate() {
+  if (!setup.apt_update_enabled || isStreaming || isUpdating()) return;
+
+  // if an apt-get update is already in progress, retry later
+  if (aptGetUpdating) {
+    setTimeout(startSoftwareUpdate, 3 * 1000);
+    return;
+  }
+
+  checkForSoftwareUpdates(function(err) {
+    if (err === null) {
+      doSoftwareUpdate();
+    } else {
+      softUpdateStatus.result = "Failed to fetch the updated package list; aborting the update.";
+      broadcastMsg('status', {updating: softUpdateStatus});
+      softUpdateStatus = null;
+    }
+  });
+
+  softUpdateStatus = {downloading: 0, unpacking: 0, setting_up: 0, total: 0};
+  broadcastMsg('status', {updating: softUpdateStatus});
+}
+
+function doSoftwareUpdate() {
+  if (!setup.apt_update_enabled || isStreaming) return;
+
+  let aptLog = '';
+  let aptErr = '';
+
+  const args = "-y -o \"Dpkg::Options::=--force-confdef\" -o \"Dpkg::Options::=--force-confold\" dist-upgrade".split(' ');
+  const aptUpgrade = spawn("apt-get", args);
+
+  aptUpgrade.stdout.on('data', function(data) {
+    let sendUpdate = false;
+
+    data = data.toString('utf8');
+    aptLog += data;
+    if (softUpdateStatus.total == 0) {
+      let count = parseUpgradePackageCount(data);
+      if (count !== undefined) {
+        softUpdateStatus.total = count;
+        sendUpdate = true;
+      }
+    }
+
+    if (softUpdateStatus.downloading != softUpdateStatus.total) {
+      const getMatch = data.match(/Get:(\d+)/);
+      if (getMatch) {
+        const i = parseInt(getMatch[1]);
+        if (i > softUpdateStatus.downloading) {
+          softUpdateStatus.downloading = Math.min(i, softUpdateStatus.total);
+          sendUpdate = true;
+        }
+      }
+    }
+
+    const unpacking = data.match(/Unpacking /g);
+    if (unpacking) {
+      softUpdateStatus.downloading = softUpdateStatus.total;
+      softUpdateStatus.unpacking += unpacking.length;
+      softUpdateStatus.unpacking = Math.min(softUpdateStatus.unpacking, softUpdateStatus.total);
+      sendUpdate = true;
+    }
+
+    const setting_up = data.match(/Setting up /g);
+    if (setting_up) {
+      softUpdateStatus.setting_up += setting_up.length;
+      softUpdateStatus.setting_up = Math.min(softUpdateStatus.setting_up, softUpdateStatus.total);
+      sendUpdate = true;
+    }
+
+    if (sendUpdate) {
+      broadcastMsg('status', {updating: softUpdateStatus});
+    }
+  });
+
+  aptUpgrade.stderr.on('data', function(data) {
+    aptErr += data;
+  });
+
+  aptUpgrade.on('close', function(code) {
+    softUpdateStatus.result = (code == 0) ? code : aptErr;
+    broadcastMsg('status', {updating: softUpdateStatus});
+
+    softUpdateStatus = null;
+    console.log(aptLog);
+    console.log(aptErr);
+
+    if (code == 0) process.exit(0);
+  });
+}
+
+
+/* SSH control */
+let sshStatus;
+function handleSshStatus(s) {
+  if (s.user !== undefined && s.active !== undefined && s.user_pass !== undefined) {
+    if (!sshStatus ||
+        s.user != sshStatus.user ||
+        s.active != sshStatus.active ||
+        s.user_pass != sshStatus.user_pass) {
+      sshStatus = s;
+      broadcastMsg('status', {ssh: sshStatus});
+    }
+  }
+}
+
+function getSshUserHash(callback) {
+  if (!setup.ssh_user) return;
+
+  const cmd = `grep "^${setup.ssh_user}:" /etc/shadow`;
+  exec(cmd, function(err, stdout, stderr) {
+    if (err === null && stdout.length) {
+      callback(stdout);
+    } else {
+      console.log(`Error getting the password hash for ${setup.ssh_user}: ${err}`);
+    }
+  });
+}
+
+function getSshStatus(conn) {
+  if (!setup.ssh_user) return undefined;
+
+  let s = {};
+  s.user = setup.ssh_user;
+
+  // Check is the SSH server is running
+  exec('systemctl is-active ssh', function(err, stdout, stderr) {
+    if (err === null) {
+      s.active = true;
+    } else {
+      if (stdout == "inactive\n") {
+        s.active = false;
+      } else {
+        console.log('Error running systemctl is-active ssh: ' + err.message);
+        return;
+      }
+    }
+
+    handleSshStatus(s);
+  });
+
+  // Check if the user's password has been changed
+  getSshUserHash(function(hash) {
+    s.user_pass = (hash != sshPasswordHash);
+    handleSshStatus(s);
+  });
+
+  // If an immediate result is expected, send the cached status
+  return sshStatus;
+}
+getSshStatus();
+
+function startStopSsh(conn, cmd) {
+  if (!setup.ssh_user) return;
+
+  switch(cmd) {
+    case 'start_ssh':
+      if (config.ssh_pass === undefined) {
+        resetSshPassword(conn);
+      }
+    case 'stop_ssh':
+      const action = cmd.split('_')[0];
+      spawnSync('systemctl', [action, 'ssh'], {detached: true});
+      getSshStatus();
+      break;
+  }
+}
+
+function resetSshPassword(conn) {
+  if (!setup.ssh_user) return;
+
+  const password = crypto.randomBytes(24).toString('base64').
+                   replace(/\+|\/|=/g, '').substring(0,20);
+  const cmd = `printf "${password}\n${password}" | passwd ${setup.ssh_user}`;
+  exec(cmd, function(err, stdout, stderr) {
+    if (err) {
+      notificationSend(conn, "ssh_pass_reset", "error",
+                       `Failed to reset the SSH password for ${setup.ssh_user}`, 10);
+      return;
+    }
+    getSshUserHash(function(hash) {
+      config.ssh_pass = password;
+      sshPasswordHash = hash;
+      saveConfig();
+      broadcastMsg('config', config);
+      getSshStatus();
+    });
+  });
+}
+
 /* Authentication */
 function setPassword(conn, password, isRemote) {
   if (conn.isAuthed || (!isRemote && !config.password_hash)) {
     const minLen = 8;
     if (password.length < minLen) {
-      sendError(conn, `Minimum password length: ${minLen} characters`);
+      notificationSend(conn, "belaui_pass_length", "error",
+                       `Minimum password length: ${minLen} characters`, 10);
       return;
     }
     config.password_hash = bcrypt.hashSync(password, BCRYPT_ROUNDS);
@@ -699,13 +1882,22 @@ function genAuthToken(isPersistent) {
   return token;
 }
 
+function sendStatus(conn) {
+  conn.send(buildMsg('status', {is_streaming: isStreaming,
+                                available_updates: availableUpdates,
+                                updating: softUpdateStatus,
+                                ssh: getSshStatus(conn),
+                                wifi: wifiBuildMsg()}));
+}
+
 function sendInitialStatus(conn) {
   conn.send(buildMsg('config', config));
   conn.send(buildMsg('pipelines', getPipelineList()));
-  conn.send(buildMsg('status', {is_streaming: isStreaming}));
+  sendStatus(conn);
   conn.send(buildMsg('netif', netif));
   conn.send(buildMsg('sensors', sensors));
   conn.send(buildMsg('revisions', revisions));
+  notificationSendPersistent(conn);
 }
 
 function connAuth(conn, sendToken) {
@@ -730,7 +1922,7 @@ function tryAuth(conn, msg) {
         conn.authToken = genAuthToken(msg.persistent_token);
         connAuth(conn, conn.authToken);
       } else {
-        sendError(conn, "Invalid password");
+        notificationSend(conn, "auth", "error", "Invalid password");
       }
     });
   } else if (typeof(msg.token) == 'string') {
@@ -745,6 +1937,8 @@ function tryAuth(conn, msg) {
 
 
 function handleMessage(conn, msg, isRemote = false) {
+  console.log(msg);
+
   if (!isRemote) {
     for (const type in msg) {
       switch(type) {
@@ -790,6 +1984,9 @@ function handleMessage(conn, msg, isRemote = false) {
       case 'netif':
         handleNetif(conn, msg[type]);
         break;
+      case 'wifi':
+        handleWifi(conn, msg[type]);
+        break;
       case 'logout':
         if (conn.authToken) {
           delete tempTokens[conn.authToken];
@@ -814,5 +2011,5 @@ setInterval(() => {
   display.refreshData(config, getPipelines(), netif, sensors, isStreaming);
 }, 1000);
 
-server.listen(80);
+server.listen(process.env.PORT || 80);
 
