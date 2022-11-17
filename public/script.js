@@ -274,7 +274,7 @@ $('#softwareUpdate').click(function() {
   const msg = 'Are you sure you want to start a software update? ' +
               'This may take several minutes. ' +
               'You won\'t be able to start a stream until it\'s completed. ' +
-              'The encoder will briefly disconnect after a succesful upgrade. ' +
+              'The encoder will briefly disconnect after a successful upgrade. ' +
               'Never remove power or reset the encoder while updating. If the encoder is powered from a battery, ensure it\'s fully charged.';
 
   if (confirm(msg)) {
@@ -303,7 +303,7 @@ function showSshStatus(s) {
     $('#stopSsh').addClass('d-none');
     $('#startSsh').removeClass('d-none');
   }
-  $('#advancedSettings').removeClass('d-none');
+  $('#sshSettings').removeClass('d-none');
 }
 
 $('#resetSshPass').click(function() {
@@ -373,8 +373,10 @@ function loadConfig(c) {
   initSrtLatencySlider(config.srt_latency ?? 2000);
   updatePipelines(null);
 
+  const srtlaAddr = config.srtla_addr ?? "";
+  showHideRelayHint(srtlaAddr);
+  document.getElementById("srtlaAddr").value = srtlaAddr;
   document.getElementById("srtStreamid").value = config.srt_streamid ?? "";
-  document.getElementById("srtlaAddr").value = config.srtla_addr ?? "";
   document.getElementById("srtlaPort").value = config.srtla_port ?? "";
 
   $('#remoteDeviceKey').val(config.remote_key);
@@ -866,6 +868,19 @@ function handleNotification(msg) {
 }
 
 
+/* Log download */
+function downloadLog(msg) {
+  const blob = new Blob([msg], {type: 'text/plain'})
+
+  const a = window.document.createElement('a');
+  a.href = window.URL.createObjectURL(blob);
+  a.download = 'belabox_log.txt';
+  a.click();
+
+  window.URL.revokeObjectURL(blob);
+}
+
+
 /* Handle server-to-client messages */
 function handleMessage(msg) {
   console.log(msg);
@@ -903,6 +918,9 @@ function handleMessage(msg) {
         break;
       case 'notification':
         handleNotification(msg[type]);
+        break;
+      case 'log':
+        downloadLog(msg[type]);
         break;
     }
   }
@@ -1151,9 +1169,12 @@ $('#logout').click(function() {
 });
 
 $('.command-btn').click(function() {
-  // convert to snake case
-  const cmd = this.id.split(/(?=[A-Z])/).join('_').toLowerCase();
-  send_command(cmd);
+  const confirmationMsg = $(this).attr('data-confirmation');
+  if (!confirmationMsg || confirm(confirmationMsg)) {
+    // convert to snake case
+    const cmd = this.id.split(/(?=[A-Z])/).join('_').toLowerCase();
+    send_command(cmd);
+  }
 });
 
 $('button.showHidePassword').click(function() {
@@ -1165,6 +1186,19 @@ $('button.showHidePassword').click(function() {
     inputField.attr('type', 'password');
     $(this).text('Show');
   }
+});
+
+function showHideRelayHint(addr) {
+  const isCloudRelay = addr.match(/belabox.net$/);
+  if (isCloudRelay) {
+    $('#cloudRelay').addClass('d-none');
+  } else {
+    $('#cloudRelay').removeClass('d-none');
+  }
+}
+
+$('input#srtlaAddr').change(function() {
+  showHideRelayHint($(this).val());
 });
 
 /* Input fields automatically copied to clipboard when clicked */

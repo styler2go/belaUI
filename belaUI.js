@@ -33,11 +33,26 @@ const SETUP_FILE = 'setup.json';
 const CONFIG_FILE = 'config.json';
 const AUTH_TOKENS_FILE = 'auth_tokens.json';
 
+const DNS_CACHE_FILE = 'dns_cache.json';
+/* Minimum age of an updated record to trigger a persistent DNS cache update (in ms)
+   Some records change with almost every query if using CDNs, etc
+   This limits the frequency of file writes */
+const DNS_MIN_AGE = 60000; // in ms
+const DNS_TIMEOUT = 2000; // in ms
+const DNS_WELLKNOWN_NAME = 'wellknown.belabox.net';
+const DNS_WELLKNOWN_ADDR = '127.1.33.7';
+
+const CONNECTIVITY_CHECK_DOMAIN = 'www.gstatic.com';
+const CONNECTIVITY_CHECK_PATH = '/generate_204';
+const CONNECTIVITY_CHECK_CODE = 204;
+const CONNECTIVITY_CHECK_BODY = '';
+
 const BCRYPT_ROUNDS = 10;
 const ACTIVE_TO = 15000;
 
 /* Disable localization for any CLI commands we run */
-process.env['LANG'] = 'C';
+process.env['LANG'] = 'C.UTF-8';
+process.env['LANGUAGE'] = 'C';
 /* Make sure apt-get doesn't expect any interactive user input */
 process.env['DEBIAN_FRONTEND'] = 'noninteractive';
 
@@ -417,6 +432,336 @@ function handleNetif(conn, msg) {
 
   conn.send(buildMsg('netif', netif));
 }
+
+
+/*
+  DNS utils w/ a persistent cache
+*/
+function resolveP(hostname, rrtype = undefined) {
+  if (rrtype !== undefined && rrtype !== 'a' && rrtype !== 'aaaa') {
+    throw(`invalid rrtype ${rrtype}`);
+  }
+
+  return new Promise(function(resolve, reject) {
+    let to;
+
+    if (DNS_TIMEOUT) {
+      to = setTimeout(function() {
+        reject('timeout');
+      }, DNS_TIMEOUT);
+    }
+
+    let ipv4Res;
+    if (rrtype === undefined || rrtype == 'a') {
+      dns.resolve4(hostname, {}, function(err, address) {
+        ipv4Res = err ? null : address;
+        returnResults();
+      });
+    }
+
+    let ipv6Res;
+    if (rrtype === undefined || rrtype == 'aaaa') {
+      dns.resolve6(hostname, {}, function(err, address) {
+        ipv6Res = err ? null : address;
+        returnResults();
+      });
+    }
+
+    const returnResults = function() {
+      // If querying both for A and AAAA records, wait for the IPv4 result
+      if (rrtype === undefined && ipv4Res === undefined) return;
+
+      let res;
+      if (ipv4Res) {
+        res = ipv4Res;
+      } else if (ipv6Res) {
+        res = ipv6Res;
+      }
+
+      if (to) {
+        clearTimeout(to);
+      }
+      if (res) {
+        if (to) {
+          clearTimeout(to);
+        }
+        resolve(res);
+      } else {
+        reject('DNS record not found');
+      }
+    }
+  });
+}
+
+let dnsCache = {};
+let dnsResults = {};
+try {
+  dnsCache = JSON.parse(fs.readFileSync(DNS_CACHE_FILE, 'utf8'));
+} catch(err) {
+  console.log("Failed to load the persistent DNS cache, starting with an empty cache");
+}
+
+function isIpv4Addr(val) {
+  return val.match(/^((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}$/) != null;
+}
+
+async function dnsCacheResolve(name, rrtype = undefined) {
+  if (rrtype) {
+    rrtype = rrtype.toLowerCase();
+    if (rrtype !== 'a' && rrtype !== 'aaaa') {
+      throw('Invalid rrtype');
+    }
+  }
+
+  if (isIpv4Addr(name) && rrtype != 'aaaa') {
+    return {addrs: [name], fromCache: false};
+  }
+
+  let badDns = true;
+
+  /* Assume that DNS resolving is broken, unless it returns
+     the expected result for a known name */
+  try {
+    const lookup = await resolveP(DNS_WELLKNOWN_NAME, 'a');
+    if (lookup.length == 1 && lookup[0] == DNS_WELLKNOWN_ADDR) {
+      badDns = false;
+    } else {
+      console.log(`DNS validation failure: got result ${lookup} instead of the expected ${DNS_WELLKNOWN_ADDR}`);
+    }
+  } catch(e) {
+    console.log(`DNS validation failure: ${e}`);
+  }
+
+  if (badDns) {
+    delete dnsResults[name];
+  } else {
+    try {
+      const res = await resolveP(name, rrtype);
+      dnsResults[name] = res;
+
+      return {addrs: res, fromCache: false};
+    } catch(err) {
+      console.log('dns error ' + err);
+    }
+  }
+
+  if (dnsCache[name]) return {addrs: dnsCache[name].result, fromCache: true};
+
+  throw('DNS query failed and no cached value is available');
+}
+
+function compareArrayElements(a1, a2) {
+  if (!Array.isArray(a1) || !Array.isArray(a2)) return false;
+
+  const cmp = {};
+  for (e of a1) {
+    cmp[e] = false;
+  }
+
+  // check that all elements of a2 are in a1
+  for (e of a2) {
+    if (cmp[e] === undefined) {
+      return false;
+    }
+    cmp[e] = true;
+  }
+
+  // check that all elements of a1 are in a2
+  for (e in cmp) {
+    if (!cmp[e]) return false;
+  }
+
+  return true;
+}
+
+async function dnsCacheValidate(name) {
+  if (!dnsResults[name]) {
+    console.log(`DNS: error validating results for ${name}: not found`);
+    return;
+  }
+
+  if (!dnsCache[name] || !compareArrayElements(dnsResults[name], dnsCache[name].results)) {
+    let writeFile = true;
+
+    if (!dnsCache[name]) {
+      dnsCache[name] = {};
+    }
+
+    if (dnsCache[name].ts &&
+        (Date.now() - dnsCache[name].ts) < DNS_MIN_AGE) writeFile = false;
+
+    dnsCache[name].result = dnsResults[name];
+
+    if (writeFile) {
+      dnsCache[name].ts = Date.now();
+      await writeTextFile(DNS_CACHE_FILE, JSON.stringify(dnsCache));
+    }
+  }
+}
+
+
+/*
+  Check Internet connectivity and if needed update the default route
+*/
+function httpGet(options) {
+  return new Promise(function(resolve, reject) {
+    let to;
+
+    if (options.timeout) {
+      to = setTimeout(function() {
+        req.destroy();
+        reject('timeout');
+      }, options.timeout);
+    }
+
+    var req = http.get(options, function(res) {
+      let response = '';
+      res.on('data', function(d) {
+        response += d;
+      });
+      res.on('end', function() {
+        if (to) {
+          clearTimeout(to);
+        }
+        resolve( {code: res.statusCode, body: response} );
+      });
+    });
+
+    req.on('error', function(e) {
+      if (to) {
+        clearTimeout(to);
+      }
+      reject(e);
+    });
+  });
+}
+
+async function checkConnectivity(remoteAddr, localAddress) {
+  try {
+    let url = {};
+    url.headers = {'Host': CONNECTIVITY_CHECK_DOMAIN};
+    url.path = CONNECTIVITY_CHECK_PATH;
+    url.host = remoteAddr;
+    url.timeout = 4000;
+
+    if (localAddress) {
+      url.localAddress = localAddress;
+    }
+
+    const res = await httpGet(url);
+    if (res.code == CONNECTIVITY_CHECK_CODE && res.body == CONNECTIVITY_CHECK_BODY) {
+      return true;
+    }
+  } catch(err) {
+    console.log('Internet connectivity HTTP check error ' + (err.code || err));
+  }
+
+  return false;
+}
+
+const execP = util.promisify(exec);
+async function clear_default_gws() {
+  try {
+    while(1) {
+      await execP("ip route del default");
+    }
+  } catch(err) {
+    return;
+  }
+}
+
+
+let updateGwLock = false;
+let updateGwLastRun = 0;
+let updateGwQueue = true;
+
+function queueUpdateGw() {
+  updateGwQueue = true;
+  updateGwWrapper();
+}
+
+async function updateGw() {
+  try {
+    var {addrs, fromCache} = await dnsCacheResolve(CONNECTIVITY_CHECK_DOMAIN);
+  } catch (err) {
+    console.log(`Failed to resolve ${CONNECTIVITY_CHECK_DOMAIN}: ${err}`);
+    return false;
+  }
+
+  for (const addr of addrs) {
+    if (await checkConnectivity(addr)) {
+      if (!fromCache) dnsCacheValidate(CONNECTIVITY_CHECK_DOMAIN);
+
+      console.log('Internet reachable via the default route');
+      notificationRemove('no_internet');
+
+      return true;
+    }
+  }
+
+  const m = 'No Internet connectivity via the default connection, re-checking all connections...';
+  notificationBroadcast('no_internet', 'warning', m, 10, true, false);
+
+  let goodIf;
+  for (const addr of addrs) {
+    for (const i in netif) {
+      console.log(`Probing internet connectivity via ${i} (${netif[i].ip})`);
+      if (await checkConnectivity(addr, netif[i].ip)) {
+        console.log(`Internet reachable via ${i} (${netif[i].ip})`);
+        if (!fromCache) dnsCacheValidate(CONNECTIVITY_CHECK_DOMAIN);
+
+        goodIf = i;
+        break;
+      }
+    }
+  }
+
+  if (goodIf) {
+    try {
+      const gw = (await execP(`ip route show table ${goodIf} default`)).stdout;
+      await clear_default_gws();
+
+      const route = `ip route add ${gw}`;
+      await execP(route);
+
+      console.log(`Set default route: ${route}`);
+      notificationRemove('no_internet');
+
+      return true;
+    } catch (err) {
+      console.log(`Error updating the default route: ${err}`);
+    }
+  }
+
+  return false;
+}
+
+const UPDATE_GW_INT = 2000;
+async function updateGwWrapper() {
+  // Do nothing if no request is queued
+  if (!updateGwQueue) return;
+
+  // Rate limit
+  const ts = getms();
+  const to = updateGwLastRun + UPDATE_GW_INT;
+  if (ts < to) return;
+
+  // Don't allow simultaneous execution
+  if (updateGwLock) return;
+
+  // Proceeding, update status
+  updateGwLastRun = ts;
+  updateGwLock = true;
+  updateGwQueue = false;
+
+  const r = await updateGw();
+  if (!r) {
+    updateGwQueue = true;
+  }
+  updateGwLock = false;
+}
+updateGwWrapper();
+setInterval(updateGwWrapper, UPDATE_GW_INT);
 
 
 /*
@@ -1010,9 +1355,11 @@ function handleWifi(conn, msg) {
   6 - notification sytem
   7 - support for config.bitrate_overlay
   8 - support for netif error
+  9 - support for the get_log command
 */
-const remoteProtocolVersion = 8;
-const remoteEndpoint = 'wss://remote.belabox.net/ws/remote';
+const remoteProtocolVersion = 9;
+const remoteEndpointHost = 'remote.belabox.net';
+const remoteEndpointPath = '/ws/remote';
 const remoteTimeout = 5000;
 const remoteConnectTimeout = 10000;
 
@@ -1038,23 +1385,6 @@ function handleRemote(conn, msg) {
   }
 }
 
-let prevRemoteBindAddr = -1;
-function getRemoteBindAddr() {
-  const netList = Object.keys(netif);
-
-  if (netList.length < 1) {
-    prevRemoteBindAddr = -1;
-    return undefined;
-  }
-
-  prevRemoteBindAddr++;
-  if (prevRemoteBindAddr >= netList.length) {
-    prevRemoteBindAddr = 0;
-  }
-
-  return netif[netList[prevRemoteBindAddr]].ip;
-}
-
 function remoteHandleMsg(msg) {
   try {
     msg = JSON.parse(msg);
@@ -1076,8 +1406,14 @@ function remoteHandleMsg(msg) {
 }
 
 let remoteConnectTimer;
-function remoteClose() {
+function remoteRetry() {
+  queueUpdateGw();
   remoteConnectTimer = setTimeout(remoteConnect, 1000);
+}
+
+function remoteClose() {
+  remoteRetry();
+
   this.removeListener('close', remoteClose);
   this.removeListener('message', remoteHandleMsg);
   remoteWs = undefined;
@@ -1087,22 +1423,31 @@ function remoteClose() {
   }
 }
 
-function remoteConnect() {
+async function remoteConnect() {
   if (remoteConnectTimer !== undefined) {
     clearTimeout(remoteConnectTimer);
     remoteConnectTimer = undefined;
   }
 
   if (config.remote_key) {
-    const bindIp = getRemoteBindAddr();
-    if (!bindIp) {
-      remoteConnectTimer = setTimeout(remoteConnect, 1000);
-      return;
+    let host = remoteEndpointHost;
+    try {
+      var {addrs, fromCache} = await dnsCacheResolve(remoteEndpointHost);
+
+      if (fromCache) {
+        host = addrs[Math.floor(Math.random()*addrs.length)];
+        queueUpdateGw();
+        console.log(`remote: DNS lookup failed, using cached address ${host}`);
+      }
+    } catch(err) {
+      return remoteRetry();
     }
-    console.log(`remote: trying to connect via ${bindIp}`);
+    console.log(`remote: trying to connect`);
 
     remoteStatusHandled = false;
-    remoteWs = new ws(remoteEndpoint, (options = {localAddress: bindIp}));
+    remoteWs = new ws(`wss://${host}${remoteEndpointPath}`,
+                      {servername: remoteEndpointHost,
+                       headers: {Host: remoteEndpointHost}});
     remoteWs.isAuthed = false;
     // Set a longer initial connection timeout - mostly to deal with slow DNS
     remoteWs.lastActive = getms() + remoteConnectTimeout - remoteTimeout;
@@ -1110,6 +1455,10 @@ function remoteConnect() {
       console.log('remote error: ' + err.message);
     });
     remoteWs.on('open', function() {
+      if (!fromCache) {
+        dnsCacheValidate(remoteEndpointHost);
+      }
+
       const auth_msg = {remote: {'auth/encoder':
                         {key: config.remote_key, version: remoteProtocolVersion}
                        }};
@@ -1435,28 +1784,40 @@ async function updateConfig(conn, params, callback) {
   if (params.srtla_port <= 0 || params.srtla_port > 0xFFFF)
     return startError(conn, "invalid SRTLA port " + params.srtla_port);
 
-  // Save the sender's ID in case we'll have to use it in the exception handler
-  const senderId = conn.senderId;
-  dns.lookup(params.srtla_addr, function(err, address, family) {
-    if (err == null) {
-      config.delay = params.delay;
-      config.pipeline = params.pipeline;
-      config.max_br = params.max_br;
-      config.srt_latency = params.srt_latency;
-      config.srt_streamid = params.srt_streamid;
-      config.srtla_addr = params.srtla_addr;
-      config.srtla_port = params.srtla_port;
-      config.bitrate_overlay = params.bitrate_overlay;
+  // resolve the srtla hostname
+  let srtlaAddr = params.srtla_addr;
+  try {
+    var {addrs, fromCache} = await dnsCacheResolve(params.srtla_addr, 'a');
+  } catch (err) {
+    startError(conn, "failed to resolve SRTLA addr " + params.srtla_addr, conn.senderId);
+    queueUpdateGw();
+    return;
+  }
 
-      saveConfig();
+  if (fromCache) {
+    srtlaAddr = addrs[Math.floor(Math.random()*addrs.length)];
+    queueUpdateGw();
+  } else {
+    /* At the moment we don't check that the SRTLA connection was established before
+       validating the DNS result. The caching DNS resolver checks for invalid
+       results from captive portals, etc, so all results *should* be good already */
+    dnsCacheValidate(params.srtla_addr);
+  }
 
-      broadcastMsgExcept(conn, 'config', config);
-      
-      callback(pipeline);
-    } else {
-      startError(conn, "failed to resolve SRTLA addr " + params.srtla_addr, senderId);
-    }
-  });
+  config.delay = params.delay;
+  config.pipeline = params.pipeline;
+  config.max_br = params.max_br;
+  config.srt_latency = params.srt_latency;
+  config.srt_streamid = params.srt_streamid;
+  config.srtla_addr = params.srtla_addr;
+  config.srtla_port = params.srtla_port;
+  config.bitrate_overlay = params.bitrate_overlay;
+
+  saveConfig();
+
+  broadcastMsgExcept(conn, 'config', config);
+
+  callback(pipeline, srtlaAddr);
 }
 
 
@@ -1516,16 +1877,17 @@ function start(conn, params) {
   }
 
   const senderId = conn.senderId;
-  updateConfig(conn, params, function(pipeline) {
+  updateConfig(conn, params, function(pipeline, srtlaAddr) {
     if (genSrtlaIpList() < 1) {
       startError(conn, "Failed to start, no available network connections", senderId);
       return;
     }
+
     isStreaming = true;
 
     spawnStreamingLoop(srtlaSendExec, [
                          9000,
-                         config.srtla_addr,
+                         srtlaAddr,
                          config.srtla_port,
                          setup.ips_file
                        ], 100, function(err) {
@@ -1617,7 +1979,25 @@ function command(conn, cmd) {
     case 'reset_ssh_pass':
       resetSshPassword(conn);
       break;
+    case 'get_log':
+      getLog(conn);
+      break;
   }
+}
+
+function getLog(conn) {
+  const senderId = conn.senderId;
+
+  exec("journalctl -u belaUI -b", {maxBuffer: 2*1024*1024}, function(err, stdout, stderr) {
+    if (err) {
+      const msg = `Failed to fetch the log: ${err}`;
+      notificationSend(conn, "log_error", "error", msg, 10);
+      console.log(msg);
+      return;
+    }
+
+    conn.send(buildMsg('log', stdout, senderId));
+  });
 }
 
 function handleConfig(conn, msg, isRemote) {
@@ -1659,6 +2039,7 @@ function parseUpgradePackageCount(text) {
     const upgradeCount = upgradedCount + newlyInstalledCount;
     return upgradeCount;
   } catch(err) {
+    console.log("parseUpgradePackageCount(): failed to parse the package info");
     return undefined;
   }
 }
@@ -1673,6 +2054,25 @@ function parseUpgradeDownloadSize(text) {
   }
 }
 
+const belaboxPackages = [
+  'belabox',
+  'belabox-apt-source',
+  'belabox-network-config',
+  'belabox-rtmp-server',
+  'belabox-sys-recommended',
+  'belacoder',
+  'belaui',
+  'srt',
+  'srtla',
+  'usb-modeswitch-data'
+];
+function includesBelaboxPackages(list) {
+  for (const p of belaboxPackages) {
+    if (list.includes(p)) return true;
+  }
+  return false;
+}
+
 function getSoftwareUpdateSize() {
   if (isStreaming || isUpdating() || aptGetUpdating) return;
 
@@ -1680,19 +2080,23 @@ function getSoftwareUpdateSize() {
     console.log(stdout);
     console.log(stderr);
 
-    /*
-    // Currently unused, may do some filtering in the future
-    let packageList = stdout.split("The following packages will be upgraded:\n")[1];
-    packageList = packageList.split(/\n\d+/)[0];
-    packageList = packageList.replace(/[\n ]+/g, ' ');
-    packageList = packageList.trim();
-    */
-
     const upgradeCount = parseUpgradePackageCount(stdout);
     let downloadSize;
     if (upgradeCount > 0) {
       downloadSize = parseUpgradeDownloadSize(stdout);
+
+      let packageList = stdout.split("The following packages will be upgraded:\n")[1];
+      packageList = packageList.split(/\n\d+/)[0];
+      packageList = packageList.replace(/[\n ]+/g, ' ');
+      packageList = packageList.trim();
+
+      if (includesBelaboxPackages(packageList)) {
+        notificationBroadcast('belabox_update', 'warning',
+          'A BELABOX update is available. Scroll down to the System menu to install it.',
+           0, true, false);
+      }
     }
+
     availableUpdates = {package_count: upgradeCount, download_size: downloadSize};
     broadcastMsg('status', {available_updates: availableUpdates});
   });
@@ -1705,16 +2109,18 @@ function checkForSoftwareUpdates(callback) {
   exec("apt-get update --allow-releaseinfo-change", function(err, stdout, stderr) {
     aptGetUpdating = false;
 
-    if (stderr.length) err = true;
+    if (stderr.length) {
+      var err = true;
+      aptGetUpdateFailures++;
+      queueUpdateGw();
+    } else {
+      aptGetUpdateFailures = 0;
+    }
+
     console.log(`apt-get update: ${(err === null) ? 'success' : 'error'}`);
     console.log(stdout);
     console.log(stderr);
 
-    if (err === null) {
-      aptGetUpdateFailures = 0;
-    } else {
-      aptGetUpdateFailures++;
-    }
     if (callback) callback(err, aptGetUpdateFailures);
   });
 }
@@ -2004,7 +2410,10 @@ function tryAuth(conn, msg) {
 
 
 function handleMessage(conn, msg, isRemote = false) {
-  console.log(msg);
+  // log all received messages except for keepalives
+  if (Object.keys(msg).length > 1 || msg.keepalive === undefined) {
+    console.log(msg);
+  }
 
   if (!isRemote) {
     for (const type in msg) {
