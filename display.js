@@ -6,6 +6,7 @@ const fs = require("fs");
 const {execSync} = require('child_process');
 const i2cBus = i2c.openSync(1);
 const ifconfig = require("ifconfig-linux");
+const {searchPipelines} = require('./functions');
 
 const CONFIG_FILE = 'config.json';
 const TEMP_FILE = '/sys/class/thermal/thermal_zone0/temp';
@@ -48,7 +49,7 @@ class Display {
   }
 
   getPipelineName() {
-    let path = this.config['pipeline_name'].split('/');
+    let path = searchPipelines(this.config['pipeline']).split('/');
 
     return path[path.length - 1].replace('h265_', '').replace('_', ' ');
   }
