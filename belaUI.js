@@ -23,7 +23,7 @@ const { exec, execSync, spawn, spawnSync, execFileSync, execFile } = require("ch
 const fs = require('fs')
 const crypto = require('crypto');
 const path = require('path');
-const dns = require('dns');
+const { Resolver} = require('dns');
 const bcrypt = require('bcrypt');
 const process = require('process');
 const util = require('util');
@@ -196,6 +196,16 @@ async function writeTextFile(file, contents) {
   return true;
 }
 
+const execP = util.promisify(exec);
+// Promise-based exec(), but without rejections
+async function execPNR(cmd) {
+  try {
+    const res = await execP(cmd);
+    return {stdout: res.stdout, stderr: res.stderr, code: 0};
+  } catch (err) {
+    return {stdout: err.stdout, stderr: err.stderr, code: err.code};
+  }
+}
 
 /* WS helpers */
 function buildMsg(type, data, id = undefined) {
@@ -231,22 +241,29 @@ function broadcastMsgExcept(conn, type, data) {
 
 /* Read the list of pipeline files */
 function readDirAbsPath(dir) {
-  const files = fs.readdirSync(dir);
-  const basename = path.basename(dir);
   const pipelines = {};
 
-  for (const f in files) {
-    const name = basename + '/' + files[f];
-    const id = crypto.createHash('sha1').update(name).digest('hex');
-    const path = dir + files[f];
-    pipelines[id] = {name: name, path: path};
-  }
+  try {
+    const files = fs.readdirSync(dir);
+    const basename = path.basename(dir);
+
+    for (const f in files) {
+      const name = basename + '/' + files[f];
+      const id = crypto.createHash('sha1').update(name).digest('hex');
+      const path = dir + files[f];
+      pipelines[id] = {name: name, path: path};
+    }
+  } catch (err) {
+    console.log(`Failed to read the pipeline files in ${dir}:`);
+    console.log(err);
+  };
 
   return pipelines;
 }
 
 function getPipelines() {
   const ps = {};
+  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + '/custom/'));
   if (setup['hw'] == 'jetson') {
     Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + '/jetson/'));
   }
@@ -436,9 +453,28 @@ function handleNetif(conn, msg) {
 /*
   DNS utils w/ a persistent cache
 */
-function resolveP(hostname, rrtype = undefined) {
+
+/*
+  dns.Resolver uses c-ares, with each instance (and the global
+  dns.resolve*() functions) mapped one-to-one to a c-ares channel
+
+  c-ares channels re-use the underlying UDP sockets for multi queries,
+  which is good for performance but the incorrect behaviour for us, as
+  it can end up trying to use stale connections long after we change
+  the default route after a network becomes unavailable
+
+  For simplicity, we create a new instance for each query unless one
+  is provided by the caller. The callers shouldn't reuse Resolver
+  instances for unrelated queries as we call resolver.cancel() on
+  timeout, which will make all pending queries time out.
+*/
+function resolveP(hostname, rrtype = undefined, resolver = undefined) {
   if (rrtype !== undefined && rrtype !== 'a' && rrtype !== 'aaaa') {
     throw(`invalid rrtype ${rrtype}`);
+  }
+
+  if (!resolver) {
+    resolver = new Resolver();
   }
 
   return new Promise(function(resolve, reject) {
@@ -446,13 +482,14 @@ function resolveP(hostname, rrtype = undefined) {
 
     if (DNS_TIMEOUT) {
       to = setTimeout(function() {
-        reject('timeout');
+        resolver.cancel();
+        reject(`DNS timeout for ${hostname}`);
       }, DNS_TIMEOUT);
     }
 
     let ipv4Res;
     if (rrtype === undefined || rrtype == 'a') {
-      dns.resolve4(hostname, {}, function(err, address) {
+      resolver.resolve4(hostname, {}, function(err, address) {
         ipv4Res = err ? null : address;
         returnResults();
       });
@@ -460,7 +497,7 @@ function resolveP(hostname, rrtype = undefined) {
 
     let ipv6Res;
     if (rrtype === undefined || rrtype == 'aaaa') {
-      dns.resolve6(hostname, {}, function(err, address) {
+      resolver.resolve6(hostname, {}, function(err, address) {
         ipv6Res = err ? null : address;
         returnResults();
       });
@@ -477,16 +514,13 @@ function resolveP(hostname, rrtype = undefined) {
         res = ipv6Res;
       }
 
-      if (to) {
-        clearTimeout(to);
-      }
       if (res) {
         if (to) {
           clearTimeout(to);
         }
         resolve(res);
       } else {
-        reject('DNS record not found');
+        reject(`DNS record not found for ${hostname}`);
       }
     }
   });
@@ -518,10 +552,13 @@ async function dnsCacheResolve(name, rrtype = undefined) {
 
   let badDns = true;
 
+  // Reuse the Resolver instance for the actual query after a succesful validation
+  const resolver = new Resolver();
+
   /* Assume that DNS resolving is broken, unless it returns
      the expected result for a known name */
   try {
-    const lookup = await resolveP(DNS_WELLKNOWN_NAME, 'a');
+    const lookup = await resolveP(DNS_WELLKNOWN_NAME, 'a', resolver);
     if (lookup.length == 1 && lookup[0] == DNS_WELLKNOWN_ADDR) {
       badDns = false;
     } else {
@@ -535,7 +572,7 @@ async function dnsCacheResolve(name, rrtype = undefined) {
     delete dnsResults[name];
   } else {
     try {
-      const res = await resolveP(name, rrtype);
+      const res = await resolveP(name, rrtype, resolver);
       dnsResults[name] = res;
 
       return {addrs: res, fromCache: false};
@@ -658,7 +695,6 @@ async function checkConnectivity(remoteAddr, localAddress) {
   return false;
 }
 
-const execP = util.promisify(exec);
 async function clear_default_gws() {
   try {
     while(1) {
@@ -1355,8 +1391,9 @@ function handleWifi(conn, msg) {
   7 - support for config.bitrate_overlay
   8 - support for netif error
   9 - support for the get_log command
+  10 - support for the get_syslog command
 */
-const remoteProtocolVersion = 9;
+const remoteProtocolVersion = 10;
 const remoteEndpointHost = 'remote.belabox.net';
 const remoteEndpointPath = '/ws/remote';
 const remoteTimeout = 5000;
@@ -1636,9 +1673,26 @@ if (setup['hw'] == 'jetson') {
   setInterval(updateSensorsJetson, 1000);
 }
 
+async function isBootconfigEnabled() {
+  const isEnabled = await execPNR("systemctl is-enabled belabox-firstboot-bootconfig")
+  return (isEnabled.code === 0);
+}
 
-/* Monitor the kernel log for undervoltage events */
+async function monitorBootconfig() {
+  if (await isBootconfigEnabled()) {
+    if (!notificationExists('bootconfig')) {
+      const msg = "Don't reset or unplug the system. The bootloader is being updated in the background and doing so may brick your board..."
+      notificationBroadcast('bootconfig', 'warning', msg, 0, true, false);
+    }
+
+    setTimeout(monitorBootconfig, 2000);
+  } else {
+    notificationRemove('bootconfig');
+  }
+}
+
 if (setup.hw == 'jetson') {
+  /* Monitor the kernel log for undervoltage events */
   const dmesg = spawn("dmesg", ["-w"]);
 
   dmesg.stdout.on('data', function(data) {
@@ -1649,6 +1703,9 @@ if (setup.hw == 'jetson') {
       notificationBroadcast('jetson_undervoltage', 'error', msg, 10*60, true, false);
     }
   });
+
+  /* Show an alert while belabox-firstboot-bootconfig is active */
+  monitorBootconfig();
 }
 
 
@@ -1697,6 +1754,7 @@ process.on('SIGUSR2', checkCamlinkUsb2);
 checkCamlinkUsb2();
 
 
+/* Stream starting, stopping, management and monitoring */
 function startError(conn, msg, id = undefined) {
   const originalId = conn.senderId;
   if (id !== undefined) {
@@ -1819,8 +1877,6 @@ async function updateConfig(conn, params, callback) {
   callback(pipeline, srtlaAddr);
 }
 
-
-/* Streaming status */
 let isStreaming = false;
 function updateStatus(status) {
   isStreaming = status;
@@ -1979,15 +2035,25 @@ function command(conn, cmd) {
       resetSshPassword(conn);
       break;
     case 'get_log':
+      getLog(conn, 'belaUI');
+      break;
+    case 'get_syslog':
       getLog(conn);
       break;
   }
 }
 
-function getLog(conn) {
+function getLog(conn, service) {
   const senderId = conn.senderId;
+  let cmd = 'journalctl -b';
+  let name = 'belabox_system_log.txt';
 
-  exec("journalctl -u belaUI -b", {maxBuffer: 2*1024*1024}, function(err, stdout, stderr) {
+  if (service) {
+    cmd += ` -u ${service}`;
+    name = service.replace('belaUI', 'belabox') + '_log.txt';
+  }
+
+  exec(cmd, {maxBuffer: 10*1024*1024}, function(err, stdout, stderr) {
     if (err) {
       const msg = `Failed to fetch the log: ${err}`;
       notificationSend(conn, "log_error", "error", msg, 10);
@@ -1995,7 +2061,7 @@ function getLog(conn) {
       return;
     }
 
-    conn.send(buildMsg('log', stdout, senderId));
+    conn.send(buildMsg('log', {name, contents: stdout}, senderId));
   });
 }
 
@@ -2026,6 +2092,7 @@ let availableUpdates = setup.apt_update_enabled ? null : false;
 let softUpdateStatus = null;
 let aptGetUpdating = false;
 let aptGetUpdateFailures = 0;
+let aptHeldBackPackages;
 
 function isUpdating() {
   return (softUpdateStatus != null);
@@ -2053,52 +2120,88 @@ function parseUpgradeDownloadSize(text) {
   }
 }
 
+// Show an update notification if there are pending updates to packages matching this list
 const belaboxPackages = [
   'belabox',
-  'belabox-apt-source',
-  'belabox-network-config',
-  'belabox-rtmp-server',
-  'belabox-sys-recommended',
   'belacoder',
   'belaui',
-  'srt',
   'srtla',
-  'usb-modeswitch-data'
+  'usb-modeswitch-data',
+  'l4t'
 ];
-function includesBelaboxPackages(list) {
+// Reboot instead of just restarting belaUI if we've updated packages matching this list
+const rebootPackages = [
+  'l4t',
+  'belabox-linux-tegra',
+  'belabox-network-config'
+];
+function packageListIncludes(list, includes) {
   for (const p of belaboxPackages) {
     if (list.includes(p)) return true;
   }
   return false;
 }
 
-function getSoftwareUpdateSize() {
+// Parses a list of packets shown by apt-get under a certain heading
+function parseAptPackageList(stdout, heading) {
+  let packageList;
+  try {
+    packageList = stdout.split(heading)[1];
+    packageList = packageList.split(/\n[\d\w]+/)[0];
+    packageList = packageList.replace(/[\n ]+/g, ' ');
+    packageList = packageList.trim();
+  } catch (err) {};
+
+  return packageList;
+}
+
+function parseAptUpgradedPackages(stdout) {
+  return parseAptPackageList(stdout, "The following packages will be upgraded:\n")
+}
+
+function parseAptUpgradeSummary(stdout) {
+  const upgradeCount = parseUpgradePackageCount(stdout);
+  let downloadSize;
+  let belaboxPackages = false;
+  if (upgradeCount > 0) {
+    downloadSize = parseUpgradeDownloadSize(stdout);
+
+    packageList = parseAptUpgradedPackages(stdout);
+    if (packageListIncludes(packageList, belaboxPackages)) {
+      belaboxPackages = true;
+    }
+  }
+
+  return {upgradeCount, downloadSize, belaboxPackages};
+}
+
+async function getSoftwareUpdateSize() {
   if (isStreaming || isUpdating() || aptGetUpdating) return;
 
-  exec("apt-get dist-upgrade --assume-no", function(err, stdout, stderr) {
-    console.log(stdout);
-    console.log(stderr);
+  // First see if any packages can be upgraded by dist-upgrade
+  let upgrade = await execPNR("apt-get dist-upgrade --assume-no");
+  let res = parseAptUpgradeSummary(upgrade.stdout);
 
-    const upgradeCount = parseUpgradePackageCount(stdout);
-    let downloadSize;
-    if (upgradeCount > 0) {
-      downloadSize = parseUpgradeDownloadSize(stdout);
-
-      let packageList = stdout.split("The following packages will be upgraded:\n")[1];
-      packageList = packageList.split(/\n\d+/)[0];
-      packageList = packageList.replace(/[\n ]+/g, ' ');
-      packageList = packageList.trim();
-
-      if (includesBelaboxPackages(packageList)) {
-        notificationBroadcast('belabox_update', 'warning',
-          'A BELABOX update is available. Scroll down to the System menu to install it.',
-           0, true, false);
-      }
+  // Otherwise, check if any packages have been held back (e.g. by dependencies changing)
+  if (res.upgradeCount == 0) {
+    aptHeldBackPackages = parseAptPackageList(upgrade.stdout, "The following packages have been kept back:\n");
+    if (aptHeldBackPackages) {
+      upgrade = await execPNR("apt-get upgrade --assume-no " + aptHeldBackPackages);
+      res = parseAptUpgradeSummary(upgrade.stdout);
     }
+  } else {
+    // Reset aptHeldBackPackages if some upgrades became available via dist-upgrade
+    aptHeldBackPackages = undefined;
+  }
 
-    availableUpdates = {package_count: upgradeCount, download_size: downloadSize};
-    broadcastMsg('status', {available_updates: availableUpdates});
-  });
+  if (res.belaboxPackages) {
+    notificationBroadcast('belabox_update', 'warning',
+      'A BELABOX update is available. Scroll down to the System menu to install it.',
+      0, true, false);
+  }
+
+  availableUpdates = {package_count: res.upgradeCount, download_size: res.downloadSize};
+  broadcastMsg('status', {available_updates: availableUpdates});
 }
 
 function checkForSoftwareUpdates(callback) {
@@ -2129,8 +2232,19 @@ function periodicCheckForSoftwareUpdates() {
     if (err === null) {
       getSoftwareUpdateSize();
     }
-    const interval = (err === null) ? oneDay : ((failures > 3) ? oneHour : oneMinute);
-    setTimeout(periodicCheckForSoftwareUpdates, interval);
+    // one hour delay after a succesful check
+    let delay = oneHour;
+    // otherwise, increasing delay depending on the number of failures
+    if (err !== null) {
+      // try after 10s for the first ~2 minutes
+      if (failures < 12) {
+        delay = 10;
+      // back off to a minute delay
+      } else {
+        delay = oneMinute;
+      }
+    }
+    setTimeout(periodicCheckForSoftwareUpdates, delay);
   });
 }
 if (setup.apt_update_enabled) {
@@ -2163,11 +2277,17 @@ function startSoftwareUpdate() {
 function doSoftwareUpdate() {
   if (!setup.apt_update_enabled || isStreaming) return;
 
+  let rebootAfterUpgrade = false;
   let aptLog = '';
   let aptErr = '';
 
-  const args = "-y -o \"Dpkg::Options::=--force-confdef\" -o \"Dpkg::Options::=--force-confold\" dist-upgrade".split(' ');
-  const aptUpgrade = spawn("apt-get", args);
+  let args = "-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold ";
+  if (aptHeldBackPackages) {
+    args += "upgrade " + aptHeldBackPackages;
+  } else {
+    args += "dist-upgrade";
+  }
+  const aptUpgrade = spawn("apt-get", args.split(' '));
 
   aptUpgrade.stdout.on('data', function(data) {
     let sendUpdate = false;
@@ -2179,6 +2299,11 @@ function doSoftwareUpdate() {
       if (count !== undefined) {
         softUpdateStatus.total = count;
         sendUpdate = true;
+
+        let packageList = parseAptUpgradedPackages(aptLog);
+        if (packageListIncludes(packageList, rebootPackages)) {
+          rebootAfterUpgrade = true;
+        }
       }
     }
 
@@ -2225,7 +2350,13 @@ function doSoftwareUpdate() {
     console.log(aptLog);
     console.log(aptErr);
 
-    if (code == 0) process.exit(0);
+    if (code == 0) {
+      if (rebootAfterUpgrade) {
+        spawnSync("reboot", {detached: true});
+      } else {
+        process.exit(0);
+      }
+    }
   });
 }
 
